@@ -1,0 +1,368 @@
+On leader LIMO:
+
+roslaunch limo_bringup limo_start.launch __ns:=leader
+
+On follower LIMO:
+
+roslaunch limo_bringup limo_start.launch __ns:=follower
+
+1) Create the ROS1 workspace + package (Laptop)
+mkdir -p ~/limo_follow_ws/src
+cd ~/limo_follow_ws/src
+catkin_create_pkg limo_leader_follower rospy geometry_msgs nav_msgs tf2_ros tf2_geometry_msgs visualization_msgs
+mkdir -p limo_leader_follower/scripts limo_leader_follower/launch limo_leader_follower/config
+cd ..
+catkin_make
+source devel/setup.bash
+---------------------------------------------------------
+2) FILE 1 — Trail follower (records leader trail in MAP)
+
+Create:
+
+nano ~/limo_follow_ws/src/limo_leader_follower/scripts/trail_follow_map_ros1.py
+
+code: 
+     #!/usr/bin/env python3
+import math
+from collections import deque
+
+import rospy
+from geometry_msgs.msg import Twist
+import tf2_ros
+import tf2_geometry_msgs
+
+
+def wrap(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+class TrailFollowMapROS1:
+    """
+    Records leader pose in MAP frame into a trail buffer.
+    Follower tracks a delayed point on that same trail => "same path" behavior.
+    Publishes /follower/cmd_vel_raw (then safety filter will modify).
+    """
+
+    def __init__(self):
+        self.map_frame = rospy.get_param("~map_frame", "map")
+        self.leader_base = rospy.get_param("~leader_base", "leader/base_link")
+        self.follower_base = rospy.get_param("~follower_base", "follower/base_link")
+
+        self.cmd_out = rospy.get_param("~cmd_out", "/follower/cmd_vel_raw")
+
+        # Trail recording
+        self.record_hz = float(rospy.get_param("~record_hz", 10.0))
+        self.delay_seconds = float(rospy.get_param("~delay_seconds", 2.0))
+        self.min_pose_gap = float(rospy.get_param("~min_pose_gap", 0.05))
+        self.delay_steps = max(1, int(self.delay_seconds * self.record_hz))
+
+        # Control tuning (safe defaults for LIMO)
+        self.k_lin = float(rospy.get_param("~k_lin", 0.8))
+        self.k_ang = float(rospy.get_param("~k_ang", 1.6))
+        self.max_lin = float(rospy.get_param("~max_lin", 0.35))
+        self.max_ang = float(rospy.get_param("~max_ang", 1.2))
+        self.arrive_dist = float(rospy.get_param("~arrive_dist", 0.25))
+
+        # If follower is very close to target, stop (for stability)
+        self.stop_when_close = bool(rospy.get_param("~stop_when_close", True))
+
+        self.trail = deque(maxlen=8000)
+
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        self.pub = rospy.Publisher(self.cmd_out, Twist, queue_size=10)
+
+        self.record_timer = rospy.Timer(rospy.Duration(1.0 / self.record_hz), self.record_leader)
+        self.ctrl_timer = rospy.Timer(rospy.Duration(0.1), self.control_step)
+
+        rospy.loginfo("TrailFollowMapROS1 started")
+        rospy.loginfo(" map_frame=%s leader_base=%s follower_base=%s", self.map_frame, self.leader_base, self.follower_base)
+        rospy.loginfo(" cmd_out=%s delay_steps=%d (%.2fs @ %.1fHz)", self.cmd_out, self.delay_steps, self.delay_seconds, self.record_hz)
+
+    def get_pose_in_map(self, base_frame):
+        ps = tf2_geometry_msgs.PoseStamped()
+        ps.header.stamp = rospy.Time(0)
+        ps.header.frame_id = base_frame
+        ps.pose.orientation.w = 1.0
+
+        try:
+            ps_map = self.tf_buffer.transform(ps, self.map_frame, rospy.Duration(0.2))
+            return ps_map.pose
+        except Exception:
+            return None
+
+    def record_leader(self, _evt):
+        pose = self.get_pose_in_map(self.leader_base)
+        if pose is None:
+            return
+
+        x = pose.position.x
+        y = pose.position.y
+
+        if len(self.trail) == 0:
+            self.trail.append((x, y))
+            return
+
+        px, py = self.trail[-1]
+        if math.hypot(x - px, y - py) >= self.min_pose_gap:
+            self.trail.append((x, y))
+
+    def control_step(self, _evt):
+        fpose = self.get_pose_in_map(self.follower_base)
+        if fpose is None:
+            return
+
+        if len(self.trail) < self.delay_steps + 1:
+            self.pub.publish(Twist())  # wait until we have trail
+            return
+
+        tx, ty = self.trail[-self.delay_steps]  # delayed trail point
+
+        fx = fpose.position.x
+        fy = fpose.position.y
+
+        q = fpose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        fyaw = math.atan2(siny, cosy)
+
+        dx = tx - fx
+        dy = ty - fy
+        dist = math.hypot(dx, dy)
+
+        cmd = Twist()
+
+        if dist < self.arrive_dist and self.stop_when_close:
+            self.pub.publish(cmd)
+            return
+
+        target_yaw = math.atan2(dy, dx)
+        yaw_err = wrap(target_yaw - fyaw)
+
+        # rotate-toward behavior: slow down when angle error is big
+        turn_penalty = max(0.15, 1.0 - min(abs(yaw_err), math.pi) / math.pi)
+
+        v = self.k_lin * dist * turn_penalty
+        w = self.k_ang * yaw_err
+
+        cmd.linear.x = min(v, self.max_lin)
+        cmd.angular.z = max(-self.max_ang, min(w, self.max_ang))
+
+        self.pub.publish(cmd)
+
+
+if __name__ == "__main__":
+    rospy.init_node("trail_follow_map_ros1")
+    TrailFollowMapROS1()
+    rospy.spin()
+
+  -------------------------------------------------------------
+  chmod +x ~/limo_follow_ws/src/limo_leader_follower/scripts/trail_follow_map_ros1.py
+
+  3) FILE 2 — Safety filter (2 rectangles in MAP)
+
+Create:
+
+nano ~/limo_follow_ws/src/limo_leader_follower/scripts/safety_filter_rect_map_ros1.py
+code: #!/usr/bin/env python3
+import math
+import rospy
+from geometry_msgs.msg import Twist
+import tf2_ros
+import tf2_geometry_msgs
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def wrap(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+class SafetyRectMapROS1:
+    """
+    Reads follower pose in MAP and filters cmd_vel to avoid forbidden rectangles.
+    cmd_in  -> cmd_out
+    /follower/cmd_vel_raw -> /follower/cmd_vel
+    """
+
+    def __init__(self):
+        self.map_frame = rospy.get_param("~map_frame", "map")
+        self.follower_base = rospy.get_param("~follower_base", "follower/base_link")
+
+        self.cmd_in = rospy.get_param("~cmd_in", "/follower/cmd_vel_raw")
+        self.cmd_out = rospy.get_param("~cmd_out", "/follower/cmd_vel")
+
+        # Two forbidden rectangles: [xmin, xmax, ymin, ymax]
+        self.rect1 = rospy.get_param("~rect1", [1.0, 2.0, 1.0, 2.0])
+        self.rect2 = rospy.get_param("~rect2", [3.0, 4.0, 0.5, 1.8])
+
+        self.margin = float(rospy.get_param("~margin", 0.25))  # safety padding
+
+        # Predict forward a little (lookahead)
+        self.lookahead_time = float(rospy.get_param("~lookahead_time", 0.8))
+
+        # How hard we turn away
+        self.turn_away_gain = float(rospy.get_param("~turn_away_gain", 1.2))
+
+        # Keep moving a tiny bit (don’t dead-stop unless you want)
+        self.min_forward = float(rospy.get_param("~min_forward", 0.05))
+
+        # Limits
+        self.max_ang = float(rospy.get_param("~max_ang", 1.8))
+
+        self.last_raw = Twist()
+
+        self.pub = rospy.Publisher(self.cmd_out, Twist, queue_size=10)
+        rospy.Subscriber(self.cmd_in, Twist, self.raw_cb, queue_size=10)
+
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        self.timer = rospy.Timer(rospy.Duration(0.05), self.step)
+
+        rospy.loginfo("SafetyRectMapROS1 started")
+        rospy.loginfo(" cmd_in=%s cmd_out=%s map_frame=%s", self.cmd_in, self.cmd_out, self.map_frame)
+        rospy.loginfo(" rect1=%s rect2=%s margin=%.2f", self.rect1, self.rect2, self.margin)
+
+    def raw_cb(self, msg):
+        self.last_raw = msg
+
+    def inside_rect(self, x, y, rect):
+        xmin, xmax, ymin, ymax = rect
+        return (xmin - self.margin <= x <= xmax + self.margin) and (ymin - self.margin <= y <= ymax + self.margin)
+
+    def get_pose_map(self):
+        ps = tf2_geometry_msgs.PoseStamped()
+        ps.header.stamp = rospy.Time(0)
+        ps.header.frame_id = self.follower_base
+        ps.pose.orientation.w = 1.0
+        try:
+            ps_map = self.tf_buffer.transform(ps, self.map_frame, rospy.Duration(0.2))
+            return ps_map.pose
+        except Exception:
+            return None
+
+    def step(self, _evt):
+        pose = self.get_pose_map()
+        if pose is None:
+            return
+
+        x = pose.position.x
+        y = pose.position.y
+
+        q = pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+        v = float(self.last_raw.linear.x)
+        w = float(self.last_raw.angular.z)
+
+        # Unicycle forward prediction
+        dt = self.lookahead_time
+        if abs(w) < 1e-6:
+            x_pred = x + v * math.cos(yaw) * dt
+            y_pred = y + v * math.sin(yaw) * dt
+        else:
+            x_pred = x + (v / w) * (math.sin(yaw + w * dt) - math.sin(yaw))
+            y_pred = y - (v / w) * (math.cos(yaw + w * dt) - math.cos(yaw))
+
+        danger = (
+            self.inside_rect(x, y, self.rect1) or self.inside_rect(x_pred, y_pred, self.rect1) or
+            self.inside_rect(x, y, self.rect2) or self.inside_rect(x_pred, y_pred, self.rect2)
+        )
+
+        cmd = Twist()
+        cmd.linear.x = v
+        cmd.angular.z = w
+
+        if danger:
+            def center(rect):
+                xmin, xmax, ymin, ymax = rect
+                return 0.5 * (xmin + xmax), 0.5 * (ymin + ymax)
+
+            c1 = center(self.rect1)
+            c2 = center(self.rect2)
+            d1 = math.hypot(x - c1[0], y - c1[1])
+            d2 = math.hypot(x - c2[0], y - c2[1])
+            cx, cy = c1 if d1 < d2 else c2
+
+            away = math.atan2(y - cy, x - cx)
+            err = wrap(away - yaw)
+
+            cmd.linear.x = max(self.min_forward, 0.3 * max(0.0, v))
+            cmd.angular.z = clamp(w + self.turn_away_gain * err, -self.max_ang, self.max_ang)
+
+        self.pub.publish(cmd)
+
+
+if __name__ == "__main__":
+    rospy.init_node("safety_filter_rect_map_ros1")
+    SafetyRectMapROS1()
+    rospy.spin()
+---------------------------------------------------------------------------
+  nano ~/limo_follow_ws/src/limo_leader_follower/launch/follower_pipeline.launch
+<launch>
+  <!-- Frames -->
+  <param name="trail_follow_map_ros1/map_frame" value="map"/>
+  <param name="trail_follow_map_ros1/leader_base" value="leader/base_link"/>
+  <param name="trail_follow_map_ros1/follower_base" value="follower/base_link"/>
+
+  <!-- Output topics -->
+  <param name="trail_follow_map_ros1/cmd_out" value="/follower/cmd_vel_raw"/>
+
+  <!-- Trail-follow tuning -->
+  <param name="trail_follow_map_ros1/record_hz" value="10.0"/>
+  <param name="trail_follow_map_ros1/delay_seconds" value="2.0"/>
+  <param name="trail_follow_map_ros1/min_pose_gap" value="0.05"/>
+  <param name="trail_follow_map_ros1/k_lin" value="0.8"/>
+  <param name="trail_follow_map_ros1/k_ang" value="1.6"/>
+  <param name="trail_follow_map_ros1/max_lin" value="0.35"/>
+  <param name="trail_follow_map_ros1/max_ang" value="1.2"/>
+  <param name="trail_follow_map_ros1/arrive_dist" value="0.25"/>
+  <param name="trail_follow_map_ros1/stop_when_close" value="true"/>
+
+  <!-- Safety filter params -->
+  <param name="safety_filter_rect_map_ros1/map_frame" value="map"/>
+  <param name="safety_filter_rect_map_ros1/follower_base" value="follower/base_link"/>
+  <param name="safety_filter_rect_map_ros1/cmd_in" value="/follower/cmd_vel_raw"/>
+  <param name="safety_filter_rect_map_ros1/cmd_out" value="/follower/cmd_vel"/>
+
+  <!-- Two forbidden rectangles in MAP -->
+  <rosparam param="safety_filter_rect_map_ros1/rect1">[1.0, 2.0, 1.0, 2.0]</rosparam>
+  <rosparam param="safety_filter_rect_map_ros1/rect2">[3.0, 4.0, 0.5, 1.8]</rosparam>
+  <param name="safety_filter_rect_map_ros1/margin" value="0.25"/>
+  <param name="safety_filter_rect_map_ros1/lookahead_time" value="0.8"/>
+  <param name="safety_filter_rect_map_ros1/turn_away_gain" value="1.2"/>
+  <param name="safety_filter_rect_map_ros1/min_forward" value="0.05"/>
+  <param name="safety_filter_rect_map_ros1/max_ang" value="1.8"/>
+
+  <node pkg="limo_leader_follower" type="trail_follow_map_ros1.py" name="trail_follow_map_ros1" output="screen"/>
+  <node pkg="limo_leader_follower" type="safety_filter_rect_map_ros1.py" name="safety_filter_rect_map_ros1" output="screen"/>
+</launch>
+
+  -------------------------------------------------------------
+
+  5) Build the package (Laptop)
+cd ~/limo_follow_ws
+catkin_make
+source devel/setup.bash
+  -----------------------------
+  Terminal A (Laptop): roscore
+roscore
+
+Terminal B (Laptop): map_server (use your map yaml)
+rosrun map_server map_server /path/to/your/map.yaml
+
+Terminal C (Laptop): leader teleop
+rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/leader/cmd_vel
+
+Terminal D (Laptop): follower pipeline (trail-follow + safety)
+source ~/limo_follow_ws/devel/setup.bash
+roslaunch limo_leader_follower follower_pipeline.launch
+  
